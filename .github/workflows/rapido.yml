@@ -1,0 +1,81 @@
+name: Robô rápido
+
+# Repositório público: Actions sem custo de minutos. Só agendamento e disparo manual (nenhum gatilho de terceiros).
+# Fronteira de dados: aqui o robô só toca conteúdo público (scripts/pipeline/supa.py, TABELAS_PUBLICAS); avisos de aluno,
+# planos pedidos e o exportar rodam no repositório privado.
+on:
+  schedule:
+    - cron: "23 */3 * * *"   # a cada 3 h, minuto ímpar (fora do pico de agendamentos do GitHub)
+  workflow_dispatch:
+    inputs:
+      etapa:
+        description: "rapido | enriquecer | figuras | publicar | classificar_local | classificar_fila | classificar | auditar | limpar"
+        required: false
+        default: "rapido"
+      repeticoes:
+        description: "Quantas vezes rodar o job rápido em sequência (1 a 3). Use com etapa = rapido para esvaziar a fila."
+        required: false
+        default: "1"
+
+permissions:
+  contents: read
+  # GitHub Models (conferente reserva) está desligado: para religar, CONFERENTE_GITHUB=1 nas variáveis, "models: read" aqui
+  # e GITHUB_TOKEN no env abaixo.
+
+concurrency:
+  group: robo-rapido
+  cancel-in-progress: false
+
+env:
+  ROBO_PUBLICO: "1"                                         # marca as rodadas como " [público]" no Painel
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+  ANTHROPIC_MODEL_RAPIDO: ${{ vars.ANTHROPIC_MODEL_RAPIDO }}
+  IA_DESLIGADA: ${{ vars.IA_DESLIGADA }}
+  IA_LIMITE_MENSAL_USD: ${{ vars.IA_LIMITE_MENSAL_USD }}
+  STORAGE_LIMITE_MB: ${{ vars.STORAGE_LIMITE_MB }}
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+  GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+  GEMINI_MODELOS_PESADO: ${{ vars.GEMINI_MODELOS_PESADO }}
+  GEMINI_MODELOS_LEVE: ${{ vars.GEMINI_MODELOS_LEVE }}
+  GEMINI_MODELOS_CONFERENCIA: ${{ vars.GEMINI_MODELOS_CONFERENCIA }}
+  GEMINI_MAX_CHAMADAS: ${{ vars.GEMINI_MAX_CHAMADAS }}
+  GEMINI_MAX_ENRIQUECER: ${{ vars.GEMINI_MAX_ENRIQUECER }}
+  GEMINI_MAX_GABARITO: ${{ vars.GEMINI_MAX_GABARITO }}
+  GEMINI_MAX_TRANSCREVER: ${{ vars.GEMINI_MAX_TRANSCREVER }}
+  GEMINI_MAX_CLASSIFICAR_FILA: ${{ vars.GEMINI_MAX_CLASSIFICAR_FILA }}
+  GEMINI_MAX_FIGURAS: ${{ vars.GEMINI_MAX_FIGURAS }}
+  CLASSIFICAR_LOCAL_MIN_NOVOS: ${{ vars.CLASSIFICAR_LOCAL_MIN_NOVOS }}
+  CONFERENCIA_TENTATIVAS: ${{ vars.CONFERENCIA_TENTATIVAS }}
+  PRAZO_ENRIQUECER_MIN: ${{ vars.PRAZO_ENRIQUECER_MIN }}
+  PRAZO_FIGURAS_MIN: ${{ vars.PRAZO_FIGURAS_MIN }}
+  PRAZO_CLASSIFICAR_FILA_MIN: ${{ vars.PRAZO_CLASSIFICAR_FILA_MIN }}
+  PRAZO_CLASSIFICAR_MIN: ${{ vars.PRAZO_CLASSIFICAR_MIN }}
+  PRAZO_AUDITAR_MIN: ${{ vars.PRAZO_AUDITAR_MIN }}
+  PYTHONUNBUFFERED: "1"
+  ETAPA: ${{ github.event.inputs.etapa || 'rapido' }}
+
+jobs:
+  rapido:
+    name: rapido (${{ matrix.vez }})
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        vez: ${{ fromJSON('{"1":[1],"2":[1,2],"3":[1,2,3]}')[github.event.inputs.repeticoes || '1'] || fromJSON('[1]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PRAZO_JOB_MIN: "16"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/pipeline/requirements.txt
+      - run: pip install -r scripts/pipeline/requirements.txt
+      - name: Rodar etapas rápidas
+        run: python scripts/pipeline/rodar.py "$ETAPA"

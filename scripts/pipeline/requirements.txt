@@ -1,0 +1,4 @@
+pdfplumber==0.11.4
+requests>=2.31
+beautifulsoup4>=4.12
+scikit-learn>=1.4

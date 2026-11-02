@@ -1,0 +1,26 @@
+name: Testes do robô
+
+# Em push nos arquivos do robô. Os testes simulam o banco e a IA: este workflow não recebe nenhum segredo.
+on:
+  push:
+    paths:
+      - "scripts/**"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  testes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/pipeline/requirements.txt
+      - run: pip install -r scripts/pipeline/requirements.txt
+      - run: python -m unittest discover -s scripts/pipeline/tests

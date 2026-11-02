@@ -1,0 +1,61 @@
+name: Robô pesado
+
+# vigiar (listas das bancas, notícias, editais, catálogo) + processar (cadernos novos) + estruturar + gerar.
+# 2x ao dia completo e mais 1x só o vigiar à noite. Só agendamento e disparo manual.
+on:
+  schedule:
+    - cron: "41 10 * * *"   # 07:41 em Belém
+    - cron: "41 18 * * *"   # 15:41 em Belém
+    - cron: "41 1 * * *"    # 22:41 em Belém: só o vigiar
+  workflow_dispatch:
+    inputs:
+      etapa:
+        description: "pesado | vigiar | noticias | editais | catalogo | processar | estruturar | gerar | diagnostico | sonda_fgv"
+        required: false
+        default: "pesado"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: robo-pesado
+  cancel-in-progress: false
+
+env:
+  ROBO_PUBLICO: "1"
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+  ANTHROPIC_MODEL_RAPIDO: ${{ vars.ANTHROPIC_MODEL_RAPIDO }}
+  IA_DESLIGADA: ${{ vars.IA_DESLIGADA }}
+  IA_LIMITE_MENSAL_USD: ${{ vars.IA_LIMITE_MENSAL_USD }}
+  STORAGE_LIMITE_MB: ${{ vars.STORAGE_LIMITE_MB }}
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+  GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+  GEMINI_MODELOS_PESADO: ${{ vars.GEMINI_MODELOS_PESADO }}
+  GEMINI_MODELOS_LEVE: ${{ vars.GEMINI_MODELOS_LEVE }}
+  GEMINI_MODELOS_CONFERENCIA: ${{ vars.GEMINI_MODELOS_CONFERENCIA }}
+  GEMINI_MAX_CHAMADAS: ${{ vars.GEMINI_MAX_CHAMADAS }}
+  GEMINI_MAX_GABARITO: ${{ vars.GEMINI_MAX_GABARITO }}
+  GEMINI_MAX_TRANSCREVER: ${{ vars.GEMINI_MAX_TRANSCREVER }}
+  PYTHONUNBUFFERED: "1"
+  ETAPA: ${{ github.event.inputs.etapa || (github.event.schedule == '41 1 * * *' && 'vigiar' || 'pesado') }}
+
+jobs:
+  pesado:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      PRAZO_JOB_MIN: "34"
+      PRAZO_PROCESSAR_MIN: "20"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/pipeline/requirements.txt
+      - run: pip install -r scripts/pipeline/requirements.txt
+      - name: Rodar etapas pesadas
+        run: python scripts/pipeline/rodar.py "$ETAPA"

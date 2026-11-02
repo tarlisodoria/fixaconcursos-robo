@@ -1,0 +1,14 @@
+# segredos e ambiente local: nunca versionar
+.env
+.env.*
+*.pem.key
+# conteúdo e provas ficam no repositório privado
+conteudo/
+fontes/
+*.pdf
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+scripts/pipeline/.cache_municipios.json

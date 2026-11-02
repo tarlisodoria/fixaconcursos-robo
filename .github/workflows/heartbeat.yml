@@ -1,0 +1,27 @@
+name: Sinal de vida
+
+# O GitHub desliga os agendamentos de repositório público depois de 60 dias sem commit. Uma vez por semana este job grava a
+# data em heartbeat.txt e commita (é o único job com permissão de escrita).
+on:
+  schedule:
+    - cron: "37 12 * * 1"   # segundas, 09:37 em Belém
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Atualizar heartbeat.txt
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
+          git config user.name "fixaconcursos-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add heartbeat.txt
+          git commit -m "Sinal de vida semanal"
+          git pull --rebase
+          git push

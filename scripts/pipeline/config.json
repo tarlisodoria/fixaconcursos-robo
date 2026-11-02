@@ -1,0 +1,37 @@
+{
+ "_doc": "Regras do vigia. 'auto' marca interesse automaticamente em concursos NOVOS (detectados depois da 1ª execução) cujo nome+cargos casem com 'regex'; vale a 1ª regra que casar; 'bancas' (opcional) restringe a regra a essas bancas. 'filtro_cargos' escolhe quais cadernos baixar (regex sobre o nome do cargo). 'filtro_por_alvo': filtro padrão quando o concurso não tem filtro próprio (CETAP e AOCP). A lista da FGV não traz cargos: a regra dela casa pelo nome do tribunal e o filtro de cargos é aplicado na página do concurso.",
+ "filtro_cargos_padrao": "Tecnologia da Informa|Tecnol[oó]gic|Seguran[cç]a da Informa|\\bTI\\b|Inform[aá]tica|Sistemas|Redes|Assistente em Administra|Assistente Administrativ|Auxiliar Administrativ|Agente Administrativ|T[eé]cnico Legislativ|Assistente Legislativ",
+ "auto": [
+  {
+   "bancas": [
+    "CEBRASPE"
+   ],
+   "regex": "(T[eé]cnico|Analista) Judici[aá]rio[^\"\\]]{0,120}?(Tecnologia da Informa|Inform[aá]tica|An[aá]lise de Sistemas|Programa[cç][aã]o de Sistemas|Desenvolvimento de Sistemas|Banco de Dados|Seguran[cç]a da Informa|\\bTI\\b)",
+   "concurso_alvo": "trt8-2026",
+   "filtro_cargos": "Tecnologia da Informa|Inform[aá]tica|An[aá]lise de Sistemas|Programa[cç][aã]o de Sistemas|Desenvolvimento de Sistemas|Banco de Dados|Seguran[cç]a da Informa|Suporte|Infraestrutura|\\bTI\\b"
+  },
+  {
+   "bancas": [
+    "FGV"
+   ],
+   "regex": "\\bTRT\\b|\\bTRT\\d|\\bTRF\\b|\\bTRF\\d|\\bTRE\\b|\\bTJ|\\bTST\\b|\\bSTJ\\b|\\bSTF\\b|\\bCNJ\\b|Tribunal (Regional|de Justi[cç]a|Superior)|tribunal-regional|tribunal-de-justica",
+   "concurso_alvo": "trt8-2026",
+   "filtro_cargos": "(T[eé]cnico|Analista) Judici[aá]rio.{0,120}?(Tecnologia da Informa|Inform[aá]tica|An[aá]lise de Sistemas|Programa[cç][aã]o de Sistemas|Desenvolvimento de Sistemas|Banco de Dados|Seguran[cç]a da Informa|\\bTI\\b)"
+  },
+  {
+   "regex": "Tecnologia da Informa|Analista de TI|T[eé]cnico de TI|Inform[aá]tica",
+   "concurso_alvo": "ifpa-2026",
+   "filtro_cargos": "Tecnologia da Informa|Tecnol[oó]gic|Seguran[cç]a da Informa|\\bTI\\b|Inform[aá]tica|Sistemas|Redes"
+  },
+  {
+   "regex": "Legislativ|Assembleia|C[aâ]mara",
+   "concurso_alvo": "alepa-2026",
+   "filtro_cargos": "Legislativ|Administrativ|Assistente em Administra"
+  }
+ ],
+ "filtro_por_alvo": {
+  "ifpa-2026": "Tecnologia da Informa|Tecnol[oó]gic|Seguran[cç]a da Informa|\\bTI\\b|Inform[aá]tica|Sistemas|Redes",
+  "alepa-2026": "Administrativ|Assistente|Auxiliar|Agente Adm|Legislativ|T[eé]cnico em Gest|Secretari",
+  "trt8-2026": "(T[eé]cnico|Analista) Judici[aá]rio.{0,120}?(Tecnologia da Informa|Inform[aá]tica|An[aá]lise de Sistemas|Programa[cç][aã]o de Sistemas|Desenvolvimento de Sistemas|Banco de Dados|Seguran[cç]a da Informa|\\bTI\\b)"
+ }
+}
