@@ -79,9 +79,9 @@ class TestAplicar(Base):
         self.assertNotIn("avisos", self.updates[-1])
 
     def test_divergencia_vai_para_humano(self):
-        with mock.patch("requests.post", side_effect=[conf_ok([{"id": "q1", "ok": False, "motivo": "comentário contradiz o gabarito"}])]):
+        with mock.patch("requests.post", side_effect=[conf_ok([{"id": "q1", "ok": False, "motivo": "comentário contradiz o gabarito", "tipo": "conteudo"}])]):
             self.rodar._aplicar_enriquecer(self.gemini_txt, ["q1"], {}, conferir_gratis=True)
-        self.assertIn("IAs divergiram: comentário contradiz o gabarito", self.updates[-1]["avisos"])
+        self.assertIn("IAs divergiram (conteúdo): comentário contradiz o gabarito", self.updates[-1]["avisos"])
         self.assertTrue(self.rodar.motivo_revisao({**self.updates[-1], "avisos": self.updates[-1]["avisos"]}))
 
     def test_sem_conferente_guarda_proposta_sem_publicar(self):

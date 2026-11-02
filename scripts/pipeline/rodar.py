@@ -912,6 +912,17 @@ def _itens_json(txt):
         return []
 
 
+def _topico_valido(top, alvo, cache_top):
+    """Id do tópico do edital do alvo, o FORA do alvo, ou None (não existe na lista)."""
+    if alvo not in cache_top:
+        cache_top[alvo] = supa.select("topicos", {"select": "id,disciplina,titulo", "concurso_id": f"eq.{alvo}"})
+    fora = "FORA" if alvo == "ifpa-2026" else f"FORA-{alvo}"
+    top = str(top or "").strip()
+    if top.upper() == "FORA" or top == fora:
+        return fora
+    return top if top in {t["id"] for t in cache_top[alvo]} else None
+
+
 def _aplicar_enriquecer(txt, ids, cache_top, conferir_gratis=False, escritor=None):
     """Grava tópico + comentário. conferir_gratis=True (escrito pelo Gemini): só grava o que o conferente (outro modelo do Google; GitHub Models só com CONFERENTE_GITHUB=1)
     aprovou; divergência vai para a fila humana com aviso; sem conferente, guarda a proposta em proposta_ia e a próxima
@@ -924,36 +935,30 @@ def _aplicar_enriquecer(txt, ids, cache_top, conferir_gratis=False, escritor=Non
         qid = it.get("id")
         if qid not in qs:
             continue
-        alvo = qs[qid]["concurso_alvo"]
-        if alvo not in cache_top:
-            cache_top[alvo] = supa.select("topicos", {"select": "id,disciplina,titulo", "concurso_id": f"eq.{alvo}"})
-        validos = {t["id"] for t in cache_top[alvo]}
-        fora = "FORA" if alvo == "ifpa-2026" else f"FORA-{alvo}"
-        top = it.get("topico")
-        top = fora if top == "FORA" else top if top in validos else None
-        propostas.append((qid, top, it.get("explicacao") or None))
+        propostas.append((qid, _topico_valido(it.get("topico"), qs[qid]["concurso_alvo"], cache_top), it.get("explicacao") or None))
     return _gravar_propostas(propostas, qs, cache_top, conferir_gratis, escritor)
 
 
 def _gravar_propostas(propostas, qs, cache_top, conferir_gratis, escritor=None):
-    veredito = {}
+    decisao = {}
     if conferir_gratis:
         try:
-            veredito = _conferir_enriquecer(propostas, qs, cache_top, escritor=escritor)
+            decisao = _decidir(propostas, qs, cache_top, escritor=escritor)
         except Exception as e:  # noqa: BLE001  (conferente com problema não derruba a etapa nem perde o que o Gemini escreveu)
             print(f"  enriquecer: conferência falhou ({type(e).__name__}: {e}); propostas guardadas para conferir na próxima rodada")
     feitos = 0
     for qid, top, exp in propostas:
         mud = {"topico_sugerido": top, "explicacao": exp}
         if conferir_gratis:
-            v = veredito.get(qid)
-            if v is None:  # conferente fora do ar, sem cota ou resposta ilegível: guarda a proposta
+            d = decisao.get(qid)
+            if d is None:  # conferente (ou desempate) fora do ar, sem cota ou resposta ilegível: guarda a proposta
                 supa.update("ingestao_questoes", {"id": f"eq.{qid}"}, {"proposta_ia": {"topico": top, "explicacao": exp, "modelo": escritor}})
                 continue
-            mud["enriquecido_por"] = f"gemini+{ia.ultimo_conferente or 'conferencia'}"  # ex.: gemini+gemma-4-31b-it
+            mud["topico_sugerido"] = d["topico"]
+            mud["enriquecido_por"] = d["por"]  # ex.: gemini+gemma-4-31b-it (+ o terceiro modelo, se desempatou)
             mud["proposta_ia"] = None
-            if not v.get("ok"):
-                mud["avisos"] = (qs[qid].get("avisos") or []) + [f"IAs divergiram: {str(v.get('motivo') or 'sem motivo')[:200]}"]
+            if d["aviso"]:
+                mud["avisos"] = (qs[qid].get("avisos") or []) + [d["aviso"]]
         supa.update("ingestao_questoes", {"id": f"eq.{qid}"}, mud)
         feitos += 1
     return feitos
@@ -979,6 +984,16 @@ def _conferir_guardadas(cache_top, maximo=800):
     return feitos
 
 
+# Avisos de divergência. Antes de 02/11 era um só, sem tipo ("IAs divergiram: ..."); o _reconferir_divergentes refaz esses.
+AVISO_DIVERGIU_ANTIGO = "IAs divergiram:"
+AVISO_DIVERGIU_TOPICO = "IAs divergiram (tópico)"
+AVISO_DIVERGIU_CONTEUDO = "IAs divergiram (conteúdo)"
+ESCRITOR_PADRAO = "gemini-3.5-flash-lite"  # 1º da lista leve: quem escreve quando o nome não veio
+TEXTO_APOIO_CONFERENCIA = 6000  # 02/11: com 700 caracteres o conferente acusava "a palavra X não está no texto" (estava adiante)
+TEXTO_APOIO_DESEMPATE = 1500    # o desempate só decide o tópico
+LIMITE_PEDIDO_CONFERENCIA = 18000  # pedido inteiro (instruções + lista de tópicos + questões): o maior que já ia ao Gemma (16K tokens/min)
+MARCA_TEXTO_CORTADO = "[texto cortado: o resto não foi enviado]"
+
 PROMPT_CONFERIR = (
     "Você confere o trabalho de outro professor de concursos. Para cada questão de prova oficial abaixo há o GABARITO OFICIAL, "
     "o tópico do edital escolhido e o comentário escrito. Aprove (ok=true) só se as duas coisas estiverem certas:\n"
@@ -987,54 +1002,217 @@ PROMPT_CONFERIR = (
     "cobra assunto que não está na lista de tópicos do edital (outro cargo, outra área, legislação de outro estado ou município). "
     "Quando o tópico for FORA, confira na LISTA DE TÓPICOS DO EDITAL (enviada abaixo): aprove se nenhum tópico da lista "
     "corresponde ao assunto da questão; reprove só se algum tópico da lista corresponder, e diga qual (id).\n"
+    "Os TEXTOS DE APOIO vão inteiros (salvo se terminarem em \"" + MARCA_TEXTO_CORTADO + "\"): antes de dizer que uma palavra, "
+    "frase ou trecho não está no texto, procure no texto INTEIRO; se o texto foi cortado, não reprove por algo que pode estar no resto.\n"
     "Na dúvida sobre o conteúdo do comentário, reprove e diga o motivo em uma frase. Devolva APENAS um JSON (lista) de "
-    "objetos {\"id\", \"ok\", \"motivo\"}.\n\n")
+    "objetos {\"id\", \"ok\", \"motivo\", \"tipo\", \"topico\"}:\n"
+    "- tipo (quando ok=false): \"conteudo\" se há problema no comentário (mesmo que o tópico também esteja errado); "
+    "\"topico\" se o comentário está certo e o problema é só o tópico.\n"
+    "- topico (quando tipo=\"topico\"): o id da LISTA DE TÓPICOS DO EDITAL que você escolheria, ou \"FORA\".\n\n")
+
+PROMPT_DESEMPATE = (
+    "Dois professores de concursos discordam do tópico do edital de cada questão de prova oficial abaixo (o comentário já "
+    "foi aprovado; a dúvida é só o tópico). Escolha o tópico certo na LISTA DE TÓPICOS DO EDITAL, considerando as duas "
+    "propostas e o motivo da discordância. Use \"FORA\" se a questão cobra assunto que não está na lista (outro cargo, outra "
+    "área, legislação de outro estado ou município). Devolva APENAS um JSON (lista) de objetos {\"id\", \"topico\", \"motivo\"} "
+    "(topico = id da lista ou \"FORA\"; motivo em uma frase).\n\n")
 
 
-def _conferir_enriquecer(propostas, qs, cache_top, limite_chars=12000, escritor=None):
-    """{id: {"ok", "motivo"}} do conferente; ids sem resposta ficam de fora. Pedidos pequenos (cota de 8 mil tokens)."""
+def _sem_acento(s):
+    return unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode().strip().lower()
+
+
+def _cortar_texto(texto, limite):
+    texto = (texto or "").strip()
+    return texto if len(texto) <= limite else texto[:limite].rstrip() + "\n" + MARCA_TEXTO_CORTADO
+
+
+def _empacotar(itens, limite):
+    """itens: [(qid, texto de apoio | None, corpo)] -> [conteúdo de cada pedido]. Cada texto de apoio vai UMA vez por pedido
+    (as questões do mesmo texto ficam juntas) e o pedido não passa de `limite` caracteres; questão sozinha maior que o
+    limite vai sozinha (menos questões por pedido, nunca texto mais curto)."""
+    ordem = {}
+    for _, texto, _ in itens:
+        ordem.setdefault(texto, len(ordem))
+    grupos, atual, tam = [], [], 0
+    for item in sorted(itens, key=lambda i: ordem[i[1]]):  # sorted é estável: a ordem dentro de cada texto se mantém
+        _, texto, corpo = item
+        novo_texto = texto and all(texto != t for _, t, _ in atual)
+        custo = len(corpo) + 60 + (len(texto) + 20 if novo_texto else 0)
+        if atual and tam + custo > limite:
+            grupos.append(atual); atual, tam = [], 0
+            custo = len(corpo) + 60 + (len(texto) + 20 if texto else 0)
+        atual.append(item); tam += custo
+    if atual:
+        grupos.append(atual)
+    pedidos = []
+    for g in grupos:
+        rot = {}
+        for _, texto, _ in g:
+            if texto and texto not in rot:
+                rot[texto] = f"T{len(rot) + 1}"
+        partes = []
+        if rot:
+            partes.append("TEXTOS DE APOIO (cada um vai uma vez; a questão diz qual usa):\n\n"
+                          + "\n\n".join(f"[{r}]\n{t}" for t, r in rot.items()) + "\n\n")
+        partes.append("QUESTÕES:\n\n" + "\n\n".join(f"ID: {qid}\n" + (f"TEXTO DE APOIO: [{rot[t]}] (acima)\n" if t else "") + corpo
+                                                  for qid, t, corpo in g))
+        pedidos.append("".join(partes))
+    return pedidos
+
+
+def _lista_top(alvo, cache_top):
+    return "\n".join(f"{t['id']} {t['titulo'][:90]}" for t in cache_top.get(alvo) or [])[:5000]
+
+
+def _questao_txt(q):
+    return (f"ENUNCIADO: {q['enunciado'][:1500]}\n" + "\n".join(f"({k}) {str(v)[:400]}" for k, v in (q["alternativas"] or {}).items())
+            + f"\nGABARITO OFICIAL: {q['gabarito'] or 'ANULADA'}")
+
+
+def _nome_topico(top, titulo):
+    return "FORA (fora do edital)" if str(top or "").startswith("FORA") else titulo.get(top, top or "nenhum")
+
+
+def _conferir_enriquecer(propostas, qs, cache_top, limite_chars=LIMITE_PEDIDO_CONFERENCIA, escritor=None):
+    """{id: {"ok", "motivo", "tipo", "topico", "por"}} do conferente; ids sem resposta ficam de fora. tipo: "topico" (o
+    comentário está certo, só o tópico não) ou "conteudo" (qualquer outra reprovação; na dúvida, conteúdo)."""
     out = {}
     if not propostas or not ia.conferente_disponivel():
         if propostas:
             print("  enriquecer: conferente indisponível; o que o Gemini escreveu fica para a próxima rodada")
         return out
     titulo = {t["id"]: f"{t['id']} [{t['disciplina']}] {t['titulo']}" for ts in cache_top.values() for t in ts}
-
-    def bloco(qid, top, exp):
-        q = qs[qid]
-        return (f"ID: {qid}\n" + (f"TEXTO DE APOIO (trecho): {q['texto_base'][:700]}\n" if q.get("texto_base") else "")
-                + f"ENUNCIADO: {q['enunciado'][:1500]}\n" + "\n".join(f"({k}) {str(v)[:400]}" for k, v in (q["alternativas"] or {}).items())
-                + f"\nGABARITO OFICIAL: {q['gabarito'] or 'ANULADA'}\nTÓPICO ESCOLHIDO: {'FORA (fora do edital)' if str(top or '').startswith('FORA') else titulo.get(top, top or 'nenhum')}\nCOMENTÁRIO: {(exp or '')[:2500]}")
-
-    # grupos de um concurso-alvo só: quando há tópico FORA, vai junto a lista de tópicos do edital (sem ela, o conferente
-    # não tem como saber se FORA está certo e reprovava quase todos; 27/10: 64 divergências, a maioria por isso)
-    def lista_top(alvo):
-        return "\n".join(f"{t['id']} {t['titulo'][:90]}" for t in cache_top.get(alvo) or [])[:5000]
-
-    grupos = []
     por_alvo = {}
     for qid, top, exp in propostas:
-        por_alvo.setdefault(qs[qid].get("concurso_alvo"), []).append((qid, top, exp))
+        q = qs[qid]
+        corpo = _questao_txt(q) + f"\nTÓPICO ESCOLHIDO: {_nome_topico(top, titulo)}\nCOMENTÁRIO: {(exp or '')[:2500]}"
+        por_alvo.setdefault(q.get("concurso_alvo"), []).append(
+            (qid, _cortar_texto(q["texto_base"], TEXTO_APOIO_CONFERENCIA) if q.get("texto_base") else None, corpo))
+    # a lista de tópicos do edital vai sempre: sem ela o conferente não sabe se FORA está certo (27/10: 64 divergências, a
+    # maioria por isso) nem tem que tópico sugerir quando discorda (o desempate precisa das duas propostas)
     for alvo, itens in por_alvo.items():
-        atual, tam, fora = [], 0, False
-        for qid, top, exp in itens:
-            b = bloco(qid, top, exp)
-            if atual and tam + len(b) > limite_chars:
-                grupos.append((alvo, atual, fora)); atual, tam, fora = [], 0, False
-            atual.append(b); tam += len(b); fora = fora or str(top or "").startswith("FORA")
-        if atual:
-            grupos.append((alvo, atual, fora))
-    for alvo, g, fora in grupos:
-        extra = f"LISTA DE TÓPICOS DO EDITAL ({alvo}):\n{lista_top(alvo)}\n\n" if fora else ""
-        try:
-            txt = ia.conferir("enriquecer-conferencia", PROMPT_CONFERIR + extra + "QUESTÕES:\n\n" + "\n\n".join(g),
-                              escritor=escritor or "gemini-3.5-flash-lite")
-        except Exception as e:  # noqa: BLE001
-            print(f"  enriquecer: {e}"); break
-        for it in _itens_json(txt):
-            if it.get("id") in qs:
-                out[it["id"]] = {"ok": it.get("ok") is True, "motivo": it.get("motivo")}
+        extra = f"LISTA DE TÓPICOS DO EDITAL ({alvo}):\n{_lista_top(alvo, cache_top)}\n\n"
+        for pedido in _empacotar(itens, limite_chars - len(PROMPT_CONFERIR) - len(extra)):
+            try:
+                txt = ia.conferir("enriquecer-conferencia", PROMPT_CONFERIR + extra + pedido, escritor=escritor or ESCRITOR_PADRAO)
+            except Exception as e:  # noqa: BLE001
+                print(f"  enriquecer: {e}"); return out
+            for it in _itens_json(txt):
+                if it.get("id") in qs and f"ID: {it['id']}\n" in pedido:  # só vale para questão que estava neste pedido
+                    ok = it.get("ok") is True
+                    tipo = None if ok else "topico" if _sem_acento(it.get("tipo")) == "topico" else "conteudo"
+                    out[it["id"]] = {"ok": ok, "motivo": it.get("motivo"), "tipo": tipo, "topico": it.get("topico"),
+                                     "por": ia.ultimo_conferente or "conferencia"}
     return out
+
+
+def _desempatar_topicos(empates, qs, cache_top, escritor):
+    """empates: [(qid, tópico do escritor, tópico do conferente | None, veredito)]. Um TERCEIRO modelo da lista de conferência
+    (nem o escritor nem o conferente) escolhe o tópico. Escolheu uma das duas propostas -> grava e segue (publica); outra
+    coisa -> fica para o humano. -> {qid: decisão}; quem não teve resposta agora fica de fora (tenta na próxima rodada)."""
+    out = {}
+    titulo = {t["id"]: f"{t['id']} [{t['disciplina']}] {t['titulo']}" for ts in cache_top.values() for t in ts}
+    grupos = {}
+    for e in empates:
+        grupos.setdefault((qs[e[0]].get("concurso_alvo"), e[3]["por"]), []).append(e)
+    for (alvo, conferente), itens in grupos.items():
+        def humano(qid, top, v, nota):
+            motivo = str(v.get("motivo") or "sem motivo")
+            return {"topico": top, "aviso": f"{AVISO_DIVERGIU_TOPICO}: {motivo[:150]}; {nota}"[:240],
+                    "por": f"gemini+{conferente}", "como": "topico"}
+        extra = f"LISTA DE TÓPICOS DO EDITAL ({alvo}):\n{_lista_top(alvo, cache_top)}\n\n"
+        blocos = [(qid, _cortar_texto(qs[qid]["texto_base"], TEXTO_APOIO_DESEMPATE) if qs[qid].get("texto_base") else None,
+                   _questao_txt(qs[qid]) + f"\nPROPOSTA A: {_nome_topico(top, titulo)}\nPROPOSTA B: "
+                   + (_nome_topico(sug, titulo) if sug else "(não indicou outro tópico da lista)")
+                   + f"\nMOTIVO DA DISCORDÂNCIA: {str(v.get('motivo') or '')[:300]}")
+                  for qid, top, sug, v in itens]
+        info = {qid: (top, sug, v) for qid, top, sug, v in itens}
+        for pedido in _empacotar(blocos, LIMITE_PEDIDO_CONFERENCIA - len(PROMPT_DESEMPATE) - len(extra)):
+            try:
+                r = ia.desempatar("enriquecer", PROMPT_DESEMPATE + extra + pedido, excluir={escritor or ESCRITOR_PADRAO, conferente})
+            except Exception as e:  # noqa: BLE001  (transitório: a decisão fica para a próxima rodada)
+                print(f"  enriquecer: {e}"); return out
+            ids = [qid for qid in info if f"ID: {qid}\n" in pedido]
+            if r is None:  # a lista de conferência não tem um terceiro modelo: o humano decide
+                out.update({qid: humano(qid, info[qid][0], info[qid][2], "sem terceiro modelo para desempatar") for qid in ids})
+                continue
+            txt, terceiro = r
+            for it in _itens_json(txt):
+                qid = it.get("id")
+                if qid not in ids:
+                    continue
+                top, sug, v = info[qid]
+                escolha = _topico_valido(it.get("topico"), alvo, cache_top)
+                if escolha and escolha in (top, sug):
+                    out[qid] = {"topico": escolha, "aviso": None, "por": f"gemini+{conferente}+{terceiro}", "como": "desempate"}
+                else:
+                    out[qid] = humano(qid, top, v, f"desempate ({terceiro}) escolheu {it.get('topico') or 'nenhum'}")
+    return out
+
+
+def _decidir(propostas, qs, cache_top, escritor=None):
+    """Conferência + desempate do tópico. -> {qid: {"topico", "aviso" (None = segue para publicar), "por", "como"}};
+    como: aprovada | desempate (resolvidas) | topico | conteudo (humano). Sem veredito agora -> qid fica de fora.
+    Divergência sobre o CONTEÚDO do comentário nunca é desempatada."""
+    ver = _conferir_enriquecer(propostas, qs, cache_top, escritor=escritor)
+    prop = {qid: top for qid, top, _ in propostas}
+    out, empates = {}, []
+    for qid, v in ver.items():
+        top = prop[qid]
+        if v["ok"]:
+            out[qid] = {"topico": top, "aviso": None, "por": f"gemini+{v['por']}", "como": "aprovada"}
+        elif v["tipo"] == "topico":
+            empates.append((qid, top, _topico_valido(v.get("topico"), qs[qid].get("concurso_alvo"), cache_top), v))
+        else:
+            out[qid] = {"topico": top, "aviso": f"{AVISO_DIVERGIU_CONTEUDO}: {str(v.get('motivo') or 'sem motivo')[:200]}",
+                        "por": f"gemini+{v['por']}", "como": "conteudo"}
+    if empates:
+        out.update(_desempatar_topicos(empates, qs, cache_top, escritor))
+    return out
+
+
+def _reconferir_divergentes(cache_top, maximo=40):
+    """Pendentes com o aviso antigo "IAs divergiram: ..." (sem tipo; até 02/11 o conferente só via 700 caracteres do texto de
+    apoio): confere de novo com o texto inteiro e desempata o tópico. A proposta é o que já está gravado (topico_sugerido +
+    explicacao; o Gemini escritor não é chamado). Sem veredito agora -> fica como está e volta na próxima rodada.
+    Resultado em robo_diagnostico (etapa reconferir_divergencias)."""
+    cand = supa.select("ingestao_questoes", {"select": "id,concurso_alvo,texto_base,enunciado,alternativas,gabarito,avisos,topico_sugerido,explicacao",
+                                             "status": "eq.pendente", "enriquecido_por": "not.is.null", "concurso_alvo": "not.is.null"})
+    cand = [q for q in cand if any(str(a).startswith(AVISO_DIVERGIU_ANTIGO) for a in q.get("avisos") or [])]
+    total = len(cand)
+    cand = cand[:maximo]
+    if not cand:
+        return 0
+    print(f"  enriquecer: reconferindo {len(cand)} de {total} divergência(s) antiga(s) com o texto de apoio inteiro")
+    for q in cand:
+        q["avisos"] = [a for a in q["avisos"] if not str(a).startswith(AVISO_DIVERGIU_ANTIGO)]
+    qs = {q["id"]: q for q in cand}
+    try:
+        decisao = _decidir([(q["id"], q["topico_sugerido"], q["explicacao"]) for q in cand], qs, cache_top)
+    except Exception as e:  # noqa: BLE001
+        print(f"  enriquecer: reconferência falhou ({type(e).__name__}: {e}); tenta na próxima rodada"); decisao = {}
+    cont = {"aprovada": 0, "desempate": 0, "conteudo": 0, "topico": 0, "adiadas": 0}
+    for q in cand:
+        d = decisao.get(q["id"])
+        if d is None:
+            cont["adiadas"] += 1; continue
+        supa.update("ingestao_questoes", {"id": f"eq.{q['id']}"},
+                    {"topico_sugerido": d["topico"], "enriquecido_por": d["por"], "avisos": q["avisos"] + ([d["aviso"]] if d["aviso"] else [])})
+        cont[d["como"]] += 1
+    resolvidas, ficaram = cont["aprovada"] + cont["desempate"], cont["conteudo"] + cont["topico"]
+    resumo = (f"{resolvidas} resolvida(s) (conferência {cont['aprovada']}, desempate {cont['desempate']}); {ficaram} ficaram "
+              f"para o humano (conteúdo {cont['conteudo']}, tópico {cont['topico']}); {cont['adiadas']} sem veredito; "
+              f"{total - len(cand)} para as próximas rodadas")
+    print(f"  enriquecer: divergências antigas: {resumo}")
+    try:
+        supa.upsert("robo_diagnostico", [{"banca": "IA", "etapa": "reconferir_divergencias", "url": None, "status_http": None, "bytes": None,
+                                          "titulo": f"{resolvidas} resolvidas, {ficaram} ficaram", "itens": len(cand),
+                                          "detalhe": json.dumps({**cont, "resolvidas": resolvidas, "ficaram": ficaram,
+                                                                 "faltam": total - len(cand)}, ensure_ascii=False)}])
+    except Exception as e:  # noqa: BLE001
+        print(f"  diagnóstico não gravado: {e}")
+    return resolvidas + ficaram
 
 
 def enriquecer(lote=8, maximo=800):
@@ -1048,6 +1226,7 @@ def enriquecer(lote=8, maximo=800):
             feitos += _aplicar_enriquecer(txt, meta.get(cid, []), cache_top)
     if ia.conferente_disponivel():
         feitos += _conferir_guardadas(cache_top)
+        feitos += _reconferir_divergentes(cache_top)  # aviso antigo "IAs divergiram:" (antes do texto inteiro e do desempate)
     ja = ia.ids_em_lote("enriquecer")
     pend = [q for q in supa.select("ingestao_questoes", {"select": "id,concurso_alvo,disciplina_prova,texto_base,enunciado,alternativas,gabarito,anulada",
                                                          "status": "eq.pendente", "topico_sugerido": "is.null", "proposta_ia": "is.null",

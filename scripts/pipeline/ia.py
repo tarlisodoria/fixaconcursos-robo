@@ -554,6 +554,23 @@ def conferir(tarefa, texto, max_tokens=3000, tentativas=4, escritor=None):
     return txt
 
 
+def desempatar(tarefa, texto, excluir=(), max_tokens=2000):
+    """Terceira opinião (só sobre o tópico): um modelo da lista de conferência que não é o escritor nem o conferente.
+    -> (texto, modelo); None se a configuração não tem um terceiro modelo; RuntimeError se ele não puder responder agora."""
+    if (os.environ.get("CONFERENTE_DESLIGADO") or "").strip().lower() in ("1", "true", "sim", "yes", "on"):
+        raise RuntimeError("conferente desligado")
+    if not [m for m in modelos_configurados("conferencia") if m not in excluir]:
+        return None
+    lista = [m for m in modelos_gemini("conferir") if m not in excluir]
+    if not lista or not gemini_disponivel("conferir"):
+        raise RuntimeError("desempate indisponível nesta rodada (terceiro modelo fora, sem cota ou teto da conferência)")
+    try:
+        txt, _ = gemini(f"conferir desempate {tarefa}", texto, max_tokens, modelos=lista, tentativas=_env_int("CONFERENCIA_TENTATIVAS", 2))
+    except RuntimeError as e:
+        raise RuntimeError(f"desempate do Google falhou: {e}") from e
+    return txt, globals().get("ultimo_modelo_gemini") or "google"
+
+
 def _conferir_github(tarefa, texto, max_tokens=3000, tentativas=4):
     """Pergunta ao GitHub Models. -> texto. RuntimeError se indisponível."""
     global _conf_chamadas, _conf_esgotado
