@@ -25,7 +25,7 @@ import aocp, cebraspe, cetap, fgv, ia, noticias, planos, supa, textos, vitrine_e
 from extrair import extrair_questoes, recortar_figuras  # noqa: E402
 from gabarito_organizador import AVISO_PRELIMINAR, conferir_com_pdf, normalizar_gabarito_organizador, precisa_conferir, preliminar  # noqa: E402
 from gabarito_texto import respostas_do_cargo  # noqa: E402
-from ia_extrair import SemIA  # noqa: E402
+from ia_extrair import SemIA, limpar_carimbos  # noqa: E402
 
 CFG = json.loads((AQUI / "config.json").read_text(encoding="utf-8"))
 agora = lambda: datetime.now(timezone.utc).isoformat()
@@ -315,6 +315,18 @@ def ia_para_cadernos():
     return True, ""
 
 
+def fila_processar(limite):
+    """Fila do processar. Prova ENVIADA pelo Admin com concurso-alvo vem primeiro (ex.: as 18 FCC do TRT8), na ordem do
+    envio (o que já foi tentado vai para o fim dos envios: um envio com erro não trava os outros), antes dos concursos das
+    bancas e das provas antigas reabertas (aguardando_ia de FGV/Cebraspe)."""
+    envios = supa.select("ingestao_concursos", {"select": "*", "interesse": "eq.true", "processado_em": "is.null", "id": "like.envio:*",
+                                                "concurso_alvo": "not.is.null", "order": "tentado_em.asc.nullsfirst,detectado_em.asc"})
+    resto = supa.select("ingestao_concursos", {"select": "*", "interesse": "eq.true", "processado_em": "is.null",
+                                               "order": "tentado_em.asc.nullsfirst,atualizado_em.desc", "limit": str(limite)})
+    ids = {c["id"] for c in envios}
+    return (envios + [c for c in resto if c["id"] not in ids])[:max(limite, len(envios))]
+
+
 def reabrir_aguardando():
     refs = sorted({p["concurso_ref"] for p in supa.select("ingestao_provas", {"select": "concurso_ref", "status": "in.(aguardando_ia,so_link)", "limit": "5000"})})
     for i in range(0, len(refs), 50):
@@ -335,7 +347,7 @@ def processar(limite=None):
     elif not com_ia:
         print(f"processar: {motivo} — cadernos guardados ficam para depois; concursos novos seguem (AOCP e cadernos com texto viram questão sem IA)")
     limite = limite or (20 if com_ia else 40)
-    pend = supa.select("ingestao_concursos", {"select": "*", "interesse": "eq.true", "processado_em": "is.null", "order": "tentado_em.asc.nullsfirst,atualizado_em.desc", "limit": str(limite)})
+    pend = fila_processar(limite)
     if not com_ia:  # reaberto numa rodada anterior e não terminado: só voltaria a bater na IA
         pend = [c for c in pend if c["id"] not in guardados]
     if not pend:
@@ -830,13 +842,19 @@ def processar_envio(conc):
             _, qs, parada = extrair_por_ia(pdf, n, banca)
             for q in qs: q["figura_ok"] = True  # a IA descreve a figura no enunciado
             log.append("caderno transcrito por IA" + (" (resposta cortada)" if parada == "max_tokens" else ""))
+        removidas = limpar_carimbos(qs)  # PDF baixado de terceiro (exceção TEC): o carimbo nunca entra na questão
+        if removidas:
+            log.append(f"carimbo de terceiro removido em {removidas} trecho(s)")
         ano = int(m.get("ano") or 0) or None
         orgao = m.get("orgao") or ""
+        # id pela sigla (lote do organizador: "trt22"): o nome por extenso cortado em 32 letras era igual para todos os TRTs
+        orgao_id = m.get("orgao_sigla") or orgao
         prova_id = supa.upsert("ingestao_provas", [{"concurso_ref": conc["id"], "cargo_cod": m.get("cargo_cod") or "01", "cargo_nome": m["cargo"],
                                                     "tipo_prova": str(m.get("tipo") or "1"), "pdf_path": m["caderno"], "gabarito": {str(k): v for k, v in gab.items()},
                                                     "n_questoes": len(gab), "status": "baixada"}], on_conflict="concurso_ref,cargo_cod,tipo_prova", retornar=True)[0]["id"]
-        pref = f"{banca.lower()}-{ano or 'sd'}-{slug(orgao, 32)}-{slug(m['cargo'], 34)}"
+        pref = f"{banca.lower()}-{ano or 'sd'}-{slug(orgao_id, 32)}-{slug(m['cargo'], 34)}"
         existentes = {q["id"] for q in supa.select("questoes", {"select": "id", "id": f"like.{pref}-q*"})}
+        fonte_prova = (m.get("fonte_prova") or "").strip()  # ex.: "Prova FCC 2022 – TRT22 – Técnico Judiciário TI"
         linhas, repetidas = [], 0
         for q in qs:
             if "erro" in q or q["numero"] not in gab:
@@ -850,7 +868,8 @@ def processar_envio(conc):
             linhas.append({"id": qid, "prova_id": prova_id, "numero": q["numero"], "banca": banca, "ano": ano, "orgao": orgao[:60], "cargo": m["cargo"][:120],
                            "disciplina_prova": q.get("disciplina"), "texto_base": q.get("texto_base"), "enunciado": q["enunciado"], "alternativas": q["alternativas"],
                            "gabarito": g, "anulada": g is None, "pode_depender_de_imagem": bool(q.get("figura")), "pagina": q.get("pagina"),
-                           "avisos": avisos, "concurso_alvo": conc.get("concurso_alvo")})
+                           "avisos": avisos, "concurso_alvo": conc.get("concurso_alvo"),
+                           "fonte": [f"{fonte_prova}, questão {q['numero']}"] if fonte_prova else None})
         faltando = sorted(set(gab) - {q["numero"] for q in qs if "erro" not in q})
         supa.upsert("ingestao_questoes", linhas, on_conflict="id")
         supa.update("ingestao_provas", {"id": f"eq.{prova_id}"}, {"status": "extraida", "erro": f"não extraídas: {faltando}" if faltando else None})
@@ -1611,7 +1630,8 @@ def publicar(maximo=4000):
             if (q.get("texto_base") or "").strip():
                 texto_id = f"{re.sub(r'-q[0-9]+$', '', q['id'])}-T{_hash_js(q['texto_base'])}"
                 supa.upsert("textos", [{"id": texto_id, "texto": q["texto_base"]}], on_conflict="id")
-            fonte = q.get("fonte") if inedita else [re.sub(r"\s+", " ", f"Prova {q.get('banca') or ''} {q.get('ano') or ''} – {q.get('orgao') or ''} – {q.get('cargo') or ''}, questão {q.get('numero')}").strip()]
+            # inédita: a norma; prova com fonte gravada no envio (lote do organizador): "Prova FCC 2022 – TRT22 – ..., questão N"
+            fonte = q.get("fonte") if inedita or q.get("fonte") else [re.sub(r"\s+", " ", f"Prova {q.get('banca') or ''} {q.get('ano') or ''} – {q.get('orgao') or ''} – {q.get('cargo') or ''}, questão {q.get('numero')}").strip()]
             supa.upsert("questoes", [{
                 "id": q["id"], "origem": "gerada" if inedita else (q.get("banca") or "aocp").lower(), "banca": q.get("banca"), "ano": q.get("ano"),
                 "orgao": q.get("orgao"), "cargo": q.get("cargo"), "nivel": None, "disciplina": disc.get(q["topico_sugerido"], q.get("disciplina_prova")),

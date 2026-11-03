@@ -34,6 +34,8 @@ Regras:
 - "disciplina": o título da seção em que a questão está (ex.: "Língua Portuguesa", "Legislação e Ética no Serviço Público").
 - Se a questão depende de imagem, gráfico, tabela ou figura, descreva-a entre colchetes no enunciado, ex.: "[Tabela: ...]", e marque "figura": true.
 - Itens romanos (I, II, III) ficam no enunciado, um por linha.
+- IGNORE carimbos e marcas d'água de terceiros que não são da banca (ex.: "www.tecconcursos.com.br", "TEC Concursos", número
+  ou nome de usuário, "Licenciado para ...", data de download): nunca os transcreva em lugar nenhum.
 {regra_formato}Responda APENAS com JSON neste formato, sem comentários:
 {{"cargo": "<nome do cargo na capa>", "textos": [{{"id": "T1", "texto": "..."}}],
  "questoes": [{{"numero": 1, "disciplina": "...", "texto": null, "enunciado": "...", "alternativas": {{"A": "...", "B": "...", "C": "...", "D": "...", "E": "..."}}, "figura": false}}]}}"""
@@ -115,6 +117,33 @@ def _transcrever_claude(blocos, max_tokens, banca):
             _falha(f"API: {erro}")
         return "".join(partes), parada
     raise RuntimeError("API indisponível após várias tentativas")
+
+
+# Carimbo de site de terceiro em PDF original da banca baixado à mão pelo dono (exceção TEC, CLAUDE.md item 10): a linha
+# que o contém sai do texto, venha a questão da IA ou do texto do PDF.
+RX_CARIMBO = re.compile(r"tec\s*concursos", re.I)
+
+
+def _sem_carimbo(texto):
+    if not texto or not RX_CARIMBO.search(texto):
+        return texto, 0
+    linhas = texto.split("\n")
+    fica = [ln for ln in linhas if not RX_CARIMBO.search(ln)]
+    return "\n".join(fica).strip(), len(linhas) - len(fica)
+
+
+def limpar_carimbos(qs):
+    """Tira do enunciado, das alternativas e do texto de apoio toda linha com "tecconcursos". -> nº de linhas removidas."""
+    total = 0
+    for q in qs:
+        for campo in ("enunciado", "texto_base"):
+            q[campo], n = _sem_carimbo(q.get(campo))
+            total += n
+        alts = q.get("alternativas") or {}
+        for k in list(alts):
+            alts[k], n = _sem_carimbo(alts[k])
+            total += n
+    return total
 
 
 def _ler_transcricao(txt, parada, formato):
