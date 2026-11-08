@@ -119,6 +119,18 @@ class TestWorkflow(unittest.TestCase):
         self.assertIn('ROBO_PUBLICO: "1"', self.wfs["rapido.yml"])
         self.assertIn('ROBO_PUBLICO: "1"', self.wfs["pesado.yml"])
 
+    def test_horario_vem_do_supabase_e_so_o_heartbeat_agenda(self):
+        # pg_cron do Supabase dispara rapido.yml {"etapa":"rapido"} e pesado.yml {"etapa":"pesado"|"vigiar"} (migração
+        # 20261108_robo_agendado_supabase.sql no privado): schedule aqui faria rodar em dobro
+        for nome in ("rapido.yml", "pesado.yml"):
+            wf = self.wfs[nome]
+            self.assertNotRegex(wf, r"(?m)^\s*schedule:", nome)
+            self.assertIn("workflow_dispatch:", wf, nome)
+            self.assertRegex(wf, r"(?m)^\s{6}etapa:", nome)  # input que o cron manda
+        self.assertIn("'rapido'", self.wfs["rapido.yml"])
+        self.assertIn("vigiar", self.wfs["pesado.yml"].split("etapa:")[1])
+        self.assertRegex(self.wfs["heartbeat.yml"], r"(?m)^\s*schedule:")
+
 
 if __name__ == "__main__":
     unittest.main()

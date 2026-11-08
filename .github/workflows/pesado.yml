@@ -1,12 +1,9 @@
 name: Robô pesado
 
 # vigiar (listas das bancas, notícias, editais, catálogo) + processar (cadernos novos) + estruturar + gerar.
-# 2x ao dia completo e mais 1x só o vigiar à noite. Só agendamento e disparo manual.
+# 2x ao dia completo e mais 1x só o vigiar à noite. Só disparo: o HORÁRIO é do Supabase desde 08/11/2026 (pg_cron
+# 'robo-pesado' 41 10,18 * * * UTC com {"etapa":"pesado"} e 'robo-vigiar' 41 1 * * * UTC com {"etapa":"vigiar"}).
 on:
-  schedule:
-    - cron: "41 10 * * *"   # 07:41 em Belém
-    - cron: "41 18 * * *"   # 15:41 em Belém
-    - cron: "41 1 * * *"    # 22:41 em Belém: só o vigiar
   workflow_dispatch:
     inputs:
       etapa:
@@ -40,7 +37,7 @@ env:
   GEMINI_MAX_GABARITO: ${{ vars.GEMINI_MAX_GABARITO }}
   GEMINI_MAX_TRANSCREVER: ${{ vars.GEMINI_MAX_TRANSCREVER }}
   PYTHONUNBUFFERED: "1"
-  ETAPA: ${{ github.event.inputs.etapa || (github.event.schedule == '41 1 * * *' && 'vigiar' || 'pesado') }}
+  ETAPA: ${{ github.event.inputs.etapa || 'pesado' }}
 
 jobs:
   pesado:

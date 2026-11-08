@@ -1,7 +1,7 @@
 # FixaConcursos – robô de ingestão
 
 Robô que alimenta o [FixaConcursos](https://www.fixaconcursos.com.br) com provas e notícias de concursos públicos. Ele roda
-aqui, no GitHub Actions, em horários agendados:
+aqui, no GitHub Actions, disparado em horários fixos pelo agendador do banco do site (`workflow_dispatch`):
 
 - **vigiar**: lê as listas de concursos e as notícias publicadas pelas bancas;
 - **processar**: baixa cadernos e gabaritos oficiais e extrai as questões;

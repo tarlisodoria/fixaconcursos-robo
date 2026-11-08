@@ -1,11 +1,11 @@
 name: Robô rápido
 
-# Repositório público: Actions sem custo de minutos. Só agendamento e disparo manual (nenhum gatilho de terceiros).
+# Repositório público: Actions sem custo de minutos. Só disparo (nenhum gatilho de terceiros). O HORÁRIO é do Supabase desde
+# 08/11/2026: pg_cron 'robo-rapido' (23 */3 * * * UTC) chama workflow_dispatch com {"etapa":"rapido"} (o agendamento do GitHub
+# atrasava horas e pulava rodadas). Pausar: select cron.unschedule('robo-rapido'); no SQL Editor.
 # Fronteira de dados: aqui o robô só toca conteúdo público (scripts/pipeline/supa.py, TABELAS_PUBLICAS); avisos de aluno,
 # planos pedidos e o exportar rodam no repositório privado.
 on:
-  schedule:
-    - cron: "23 */3 * * *"   # a cada 3 h, minuto ímpar (fora do pico de agendamentos do GitHub)
   workflow_dispatch:
     inputs:
       etapa:
