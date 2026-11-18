@@ -126,10 +126,13 @@ def _vigiar():
     # CETAP fora: o site bloqueia robôs (desafio do Cloudflare, 403). Provas da CETAP entram pelo envio manual no Admin.
     for nome, fn in (("AOCP", lambda: vigiar_banca("AOCP", aocp)), ("CEBRASPE", lambda: vigiar_banca("CEBRASPE", cebraspe)),
                      ("FGV", lambda: vigiar_banca("FGV", fgv, interesse_todos=True))):
+        lidos = novos = erros = 0
         try:
-            fn()
+            lidos, novos = fn()
         except Exception as e:  # noqa: BLE001  (uma banca fora do ar não derruba as outras)
+            erros = 1
             print(f"vigiar {nome}: ERRO {e}"); traceback.print_exc()
+        print(f"vigiar {nome}: lidos {lidos}, novos {novos}, erros {erros}")  # resumo de toda rodada (zero novos por dias = olhar a banca)
 
 
 def vigiar_banca(banca, mod, interesse_todos=False):
@@ -177,6 +180,7 @@ def vigiar_banca(banca, mod, interesse_todos=False):
     print(f"vigiar: {len(lista)} concursos na {banca}, {len(novos)} novos" + (" (1ª execução: só catalogados)" if primeira_vez else ""))
     for n in novos[:20]:
         print("  novo:", n["id"], n["nome"][:70], "| interesse" if n.get("interesse") else "")
+    return len(lista), len(novos)
 
 
 # ---------------------------------------------------------------- processar
@@ -285,7 +289,7 @@ def guardar_para_ia(prova_id, salvo, motivo):
 
 
 def provas_do(conc_id):
-    return supa.select("ingestao_provas", {"select": "cargo_cod,status,erro,pdf_path", "concurso_ref": f"eq.{conc_id}"})
+    return supa.select("ingestao_provas", {"select": "cargo_cod,status,erro,pdf_path,gabarito", "concurso_ref": f"eq.{conc_id}"})
 
 
 def ja_feitas(provas):
@@ -301,8 +305,13 @@ def max_cadernos(com_ia_max):
 
 
 def aguardando_com_pdf():
-    """Concursos com caderno guardado no Storage esperando IA (aguardando_ia com pdf_path)."""
-    return {p["concurso_ref"] for p in supa.select("ingestao_provas", {"select": "concurso_ref", "status": "eq.aguardando_ia", "pdf_path": "not.is.null"})}
+    """Concursos com caderno guardado no Storage esperando IA (aguardando_ia com pdf_path) -> {concurso: criado_em da prova
+    guardada mais antiga}: a fila dos reabertos anda da mais antiga para a mais nova."""
+    out = {}
+    for p in supa.select("ingestao_provas", {"select": "concurso_ref,criado_em", "status": "eq.aguardando_ia", "pdf_path": "not.is.null"}):
+        d = p.get("criado_em") or ""
+        out[p["concurso_ref"]] = min(out.get(p["concurso_ref"], d), d)
+    return out
 
 
 def ia_para_cadernos():
@@ -315,16 +324,21 @@ def ia_para_cadernos():
     return True, ""
 
 
-def fila_processar(limite):
+def fila_processar(limite, guardados=None):
     """Fila do processar. Prova ENVIADA pelo Admin com concurso-alvo vem primeiro (ex.: as 18 FCC do TRT8), na ordem do
     envio (o que já foi tentado vai para o fim dos envios: um envio com erro não trava os outros), antes dos concursos das
-    bancas e das provas antigas reabertas (aguardando_ia de FGV/Cebraspe)."""
+    bancas e das provas antigas reabertas (aguardando_ia de FGV/Cebraspe). `guardados` ({concurso: prova mais antiga}, de
+    aguardando_com_pdf): os reabertos vão no fim, da prova mais antiga para a mais nova (antes o rodízio por tentado_em
+    deixava provas de outubro sem tentativa); o laço para no prazo, então eles não têm limite de quantidade."""
+    guardados = guardados or {}
     envios = supa.select("ingestao_concursos", {"select": "*", "interesse": "eq.true", "processado_em": "is.null", "id": "like.envio:*",
                                                 "concurso_alvo": "not.is.null", "order": "tentado_em.asc.nullsfirst,detectado_em.asc"})
     resto = supa.select("ingestao_concursos", {"select": "*", "interesse": "eq.true", "processado_em": "is.null",
-                                               "order": "tentado_em.asc.nullsfirst,atualizado_em.desc", "limit": str(limite)})
+                                               "order": "tentado_em.asc.nullsfirst,atualizado_em.desc"})
     ids = {c["id"] for c in envios}
-    return (envios + [c for c in resto if c["id"] not in ids])[:max(limite, len(envios))]
+    novos = [c for c in resto if c["id"] not in ids and c["id"] not in guardados]
+    reabertos = sorted((c for c in resto if c["id"] not in ids and c["id"] in guardados), key=lambda c: guardados[c["id"]])
+    return (envios + novos)[:max(limite, len(envios))] + reabertos
 
 
 def reabrir_aguardando():
@@ -340,6 +354,8 @@ def processar(limite=None):
     import time
     global _inicio_processar
     _inicio_processar = time.time()
+    ler_gabaritos_guardados()  # lista LEVE, independe da cota pesada
+    resumo_fila()
     guardados = aguardando_com_pdf()
     com_ia, motivo = ia_para_cadernos()
     if com_ia and guardados:
@@ -347,7 +363,7 @@ def processar(limite=None):
     elif not com_ia:
         print(f"processar: {motivo} — cadernos guardados ficam para depois; concursos novos seguem (AOCP e cadernos com texto viram questão sem IA)")
     limite = limite or (20 if com_ia else 40)
-    pend = fila_processar(limite)
+    pend = fila_processar(limite, guardados)
     if not com_ia:  # reaberto numa rodada anterior e não terminado: só voltaria a bater na IA
         pend = [c for c in pend if c["id"] not in guardados]
     if not pend:
@@ -356,6 +372,10 @@ def processar(limite=None):
     for conc in pend:
         if tempo_esgotado():
             print("processar: tempo da rodada esgotado, o resto fica para a próxima"); break
+        # teto/cota/503 da lista pesada no meio da rodada: os reabertos (no fim da fila) seriam dados como resolvidos por
+        # ja_feitas, marcados processados sem tentativa e iriam para o fim do rodízio; ficam na frente da próxima rodada
+        if conc["id"] in guardados and not ia.disponivel("transcrever"):
+            print(f"processar: transcrição fora desta rodada ({ia.motivo_indisponivel('transcrever')}); os cadernos guardados ficam para a próxima"); break
         if rodada_cheia():
             print(f"processar: {GUARDAR_POR_RODADA} cadernos guardados nesta rodada (limite para não lotar o Storage); o resto fica para amanhã"); break
         supa.update("ingestao_concursos", {"id": f"eq.{conc['id']}"}, {"tentado_em": agora()})  # rodízio da fila
@@ -636,9 +656,7 @@ def orgao_fgv(titulo):
 def processar_fgv(conc):
     """FGV: caderno Tipo 1 de cada cargo que passa no filtro + gabarito oficial definitivo (um PDF para todos os cargos).
     A IA transcreve o caderno e lê no gabarito só as respostas do cargo; o gabarito é sempre o documento oficial."""
-    import io
-    import pdfplumber
-    from ia_extrair import extrair_por_ia, gabarito_por_ia
+    from ia_extrair import extrair_por_ia
     s = fgv.sessao()
     cid = conc["externo_id"]
     log = []
@@ -669,9 +687,7 @@ def processar_fgv(conc):
             if url not in gabaritos:
                 gpdf = fgv.baixar(s, url)
                 guardar_pdf(f"fgv/{cid}/{slug(url.rsplit('/', 1)[-1], 80)}.pdf", gpdf)
-                with pdfplumber.open(io.BytesIO(gpdf)) as g:
-                    pags = [(p.extract_text() or "") for p in g.pages]
-                gabaritos[url] = (gpdf, pags, fgv.parse_gabarito("\n".join(pags)))
+                gabaritos[url] = _doc_gabarito_fgv(gpdf)
             return gabaritos[url]
         ano = fgv._ano(cid, titulo) or ano_de(conc)
         orgao = orgao_fgv(titulo)
@@ -685,21 +701,13 @@ def processar_fgv(conc):
                 gurl = fgv.gabarito_definitivo(partes, c["parte"])
                 if not gurl:
                     raise RuntimeError("gabarito definitivo desta parte ainda não publicado")
-                gpdf, gpaginas, gabs = gabarito_de(gurl)
-                par = fgv.achar_no_gabarito(gabs, c["cargo"], c["arquivo"], c["tipo"])
-                gab, motivo_gab = None, "sem IA para ler o gabarito"
-                if par:
-                    achado, gab = par
-                elif ia.disponivel("gabarito"):  # layout diferente: a IA lê só as páginas do cargo no documento oficial
-                    try:
-                        achado, gab = gabarito_por_ia(gpdf, fgv.paginas_do_gabarito(gpaginas, c["cargo"], c["arquivo"]),
-                                                      c["arquivo"], c["cargo"], c["tipo"])
-                        achado = f"IA: {achado}"
-                    except SemIA as e:
-                        gab, motivo_gab = None, str(e)
+                antiga = antigas.get(c["cod"])
+                if antiga and antiga.get("gabarito"):  # já lido (ler_gabaritos_guardados ou rodada anterior): não lê de novo
+                    achado, gab, motivo_gab = "guardado", {int(k): v for k, v in antiga["gabarito"].items()}, None
+                else:
+                    achado, gab, motivo_gab = _gabarito_fgv(*gabarito_de(gurl), c["cargo"], c["arquivo"], c["tipo"])
                 if gab is not None and len(gab) < 10:
                     raise RuntimeError(f"gabarito do cargo não encontrado no definitivo ({len(gab)} respostas lidas)")
-                antiga = antigas.get(c["cod"])
                 pdf = pdf_de(antiga, lambda: fgv.baixar(s, c["url"]))
                 salvo = (antiga or {}).get("pdf_path") or guardar_pdf(f"fgv/{cid}/{slug(c['cod'], 90)}-tipo{c['tipo']}.pdf", pdf)
                 prova_id = supa.upsert("ingestao_provas", [{"concurso_ref": conc["id"], "cargo_cod": c["cod"], "cargo_nome": c["cargo"][:200], "tipo_prova": c["tipo"],
@@ -750,6 +758,82 @@ def processar_fgv(conc):
     except Exception as e:  # noqa: BLE001
         supa.update("ingestao_concursos", {"id": f"eq.{conc['id']}"}, {"log": f"{agora()}: ERRO {e}"[:4000]})
         traceback.print_exc()
+
+
+def _doc_gabarito_fgv(gpdf):
+    """PDF do gabarito definitivo FGV -> (pdf, texto por página, respostas no layout conhecido)."""
+    import io
+    import pdfplumber
+    with pdfplumber.open(io.BytesIO(gpdf)) as g:
+        pags = [(p.extract_text() or "") for p in g.pages]
+    return gpdf, pags, fgv.parse_gabarito("\n".join(pags))
+
+
+def _gabarito_fgv(gpdf, gpaginas, gabs, cargo, arquivo, tipo):
+    """Respostas do cargo no gabarito definitivo FGV: layout conhecido sem IA; senão a lista LEVE do Gemini (gabarito é tarefa
+    leve em ia.classe_gemini) lê só as páginas do cargo. Validado em 18/11/2026: 240/240 respostas iguais à leitura
+    determinística em 3 gabaritos reais (pcpi25, aleam25, tjscservidor26). -> (achado, {questão: letra|None} ou None, motivo)"""
+    from ia_extrair import gabarito_por_ia
+    par = fgv.achar_no_gabarito(gabs, cargo, arquivo, tipo)
+    if par:
+        return par[0], par[1], None
+    if not ia.disponivel("gabarito"):
+        return None, None, ia.motivo_indisponivel("gabarito")
+    try:
+        achado, gab = gabarito_por_ia(gpdf, fgv.paginas_do_gabarito(gpaginas, cargo, arquivo), arquivo, cargo, tipo)
+        return f"IA: {achado}", gab, None
+    except SemIA as e:
+        return None, None, str(e)
+
+
+def ler_gabaritos_guardados(maximo=30):
+    """Provas FGV guardadas sem gabarito ("layout diferente"): lê só o gabarito, com a lista LEVE (Flash Lite, 500/dia cada),
+    antes e separado da transcrição (lista pesada, 20/dia). Antes a leitura vivia no laço do caderno, atrás da transcrição
+    lenta, e 67 provas ficaram paradas desde outubro. Mais antigas primeiro. -> quantas leu."""
+    if not ia.disponivel("gabarito"):
+        return 0
+    provas = supa.select("ingestao_provas", {"select": "id,cargo_cod,cargo_nome,tipo_prova,origem", "status": "eq.aguardando_ia",
+                                             "gabarito": "is.null", "concurso_ref": "like.fgv:*", "order": "criado_em.asc"})
+    s, docs, lidos, tentados = None, {}, 0, 0
+    for p in provas[:maximo]:
+        if tempo_esgotado() or not ia.disponivel("gabarito"):
+            break
+        gurl = (p.get("origem") or {}).get("gabarito_url")
+        if not gurl:
+            continue
+        tentados += 1
+        try:
+            if gurl not in docs:
+                s = s or fgv.sessao()
+                docs[gurl] = _doc_gabarito_fgv(fgv.baixar(s, gurl))
+            achado, gab, motivo = _gabarito_fgv(*docs[gurl], p.get("cargo_nome") or "", p["cargo_cod"], p.get("tipo_prova") or "1")
+        except Exception as e:  # noqa: BLE001  (site da banca fora do ar: tenta na próxima rodada)
+            print(f"  gabarito {p['cargo_cod'][:40]}: ERRO {e}"); continue
+        filtro = {"id": f"eq.{p['id']}"}
+        if gab is None:  # motivo real e atual (cota, sobrecarga...) no lugar do texto antigo
+            supa.update("ingestao_provas", filtro, {"erro": f"aguardando IA: gabarito em layout diferente ({motivo})"[:500]})
+        elif len(gab) < 10:  # o documento não traz o cargo (ex.: tcepa24, mprj2025): humano confere qual gabarito vale
+            supa.update("ingestao_provas", filtro, {"status": "erro", "erro": f"gabarito do cargo não encontrado no gabarito definitivo "
+                                                                         f"({len(gab)} respostas lidas): conferir se o documento é o certo"})
+        else:
+            supa.update("ingestao_provas", filtro, {"gabarito": {str(k): v for k, v in gab.items()}, "n_questoes": len(gab),
+                                                    "erro": f"aguardando IA: gabarito lido ({str(achado)[:60]}); falta transcrever o caderno"[:500]})
+            lidos += 1
+    if provas:
+        print(f"gabaritos: {lidos} lido(s) de {tentados} tentado(s); {len(provas)} prova(s) esperavam só o gabarito")
+    return lidos
+
+
+def resumo_fila():
+    """Linha do log: provas esperando IA e dias para zerar com a cota grátis da lista pesada (melhor caso: 1 pedido por caderno)."""
+    try:
+        n = len(supa.select("ingestao_provas", {"select": "id", "status": "in.(aguardando_ia,so_link)"}))
+        modelos = ia.modelos_gemini("transcrever")
+        cota = sum(ia.limite_dia(m) or 0 for m in modelos)
+        prev = f"~{-(-n // cota)} dia(s) para zerar" if cota else "sem previsão (nenhum modelo pesado disponível)"
+        print(f"fila IA: {n} prova(s) esperando; cota pesada {cota} pedidos/dia ({len(modelos)} modelo(s), dividida com a etapa figuras) -> {prev} no melhor caso")
+    except Exception as e:  # noqa: BLE001  (linha de log nunca derruba a etapa)
+        print(f"fila IA: não contei ({e})")
 
 
 def erro_passageiro(msg):
@@ -2061,7 +2145,30 @@ def classificar(lote=25, maximo=3000):
 DISC_AUDITAR = ("dcon", "dadm", "leg", "afo", "adm", "info", "ti", "dh", "edu")
 
 
+DIAS_SEM_PROVA_NOVA = 7
+
+
+def avisar_sem_prova_nova(agora_=None):
+    """Nenhuma prova nova em ingestao_provas há DIAS_SEM_PROVA_NOVA dias -> aviso no Painel do robô (card "Falhas de IA nas
+    últimas 24 h", que lê robo_diagnostico etapa ia_erros com a amostra em texto). -> dias sem prova nova, ou None."""
+    try:
+        ult = supa.select("ingestao_provas", {"select": "criado_em", "order": "criado_em.desc", "limit": "1"})
+        if not ult:
+            return None
+        desde = datetime.fromisoformat(ult[0]["criado_em"].replace("Z", "+00:00"))
+        dias = ((agora_ or datetime.now(timezone.utc)) - desde).days
+        if dias >= DIAS_SEM_PROVA_NOVA:
+            msg = f"nenhuma prova nova em ingestao_provas desde {desde:%d/%m} ({dias} dias): confira as linhas 'vigiar <banca>' do log"
+            print(f"auditar: AVISO — {msg}")
+            ia.falha("robô", "sem prova nova", msg)
+        return dias
+    except Exception as e:  # noqa: BLE001  (aviso nunca derruba a etapa)
+        print(f"auditar: aviso de prova nova não conferido ({e})")
+        return None
+
+
 def auditar(lote=20, maximo=1500):
+    avisar_sem_prova_nova()
     if not ia.disponivel("auditar"):
         print(f"auditar: pulando — {ia.motivo_indisponivel('auditar')}"); return
 
