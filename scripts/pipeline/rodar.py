@@ -289,7 +289,7 @@ def guardar_para_ia(prova_id, salvo, motivo):
 
 
 def provas_do(conc_id):
-    return supa.select("ingestao_provas", {"select": "cargo_cod,status,erro,pdf_path,gabarito", "concurso_ref": f"eq.{conc_id}"})
+    return supa.select("ingestao_provas", {"select": "cargo_cod,status,erro,pdf_path,gabarito,origem","concurso_ref": f"eq.{conc_id}"})
 
 
 def ja_feitas(provas):
@@ -698,16 +698,17 @@ def processar_fgv(conc):
             feitos += 1
             prova_id = salvo = None
             try:
-                gurl = fgv.gabarito_definitivo(partes, c["parte"])
-                if not gurl:
+                gurls = fgv.gabaritos_definitivos(partes, c["parte"])
+                if not gurls:
                     raise RuntimeError("gabarito definitivo desta parte ainda não publicado")
                 antiga = antigas.get(c["cod"])
                 if antiga and antiga.get("gabarito"):  # já lido (ler_gabaritos_guardados ou rodada anterior): não lê de novo
+                    gurl = (antiga.get("origem") or {}).get("gabarito_url") or gurls[0]
                     achado, gab, motivo_gab = "guardado", {int(k): v for k, v in antiga["gabarito"].items()}, None
                 else:
-                    achado, gab, motivo_gab = _gabarito_fgv(*gabarito_de(gurl), c["cargo"], c["arquivo"], c["tipo"])
-                if gab is not None and len(gab) < 10:
-                    raise RuntimeError(f"gabarito do cargo não encontrado no definitivo ({len(gab)} respostas lidas)")
+                    gurl, achado, gab, motivo_gab = _gabarito_fgv_docs(gurls, gabarito_de, c["cargo"], c["arquivo"], c["tipo"])
+                if gab is not None and len(gab) < 10:  # só quando nenhum gabarito definitivo da página cita o cargo
+                    raise RuntimeError(f"gabarito do cargo não encontrado no definitivo ({motivo_gab})")
                 pdf = pdf_de(antiga, lambda: fgv.baixar(s, c["url"]))
                 salvo = (antiga or {}).get("pdf_path") or guardar_pdf(f"fgv/{cid}/{slug(c['cod'], 90)}-tipo{c['tipo']}.pdf", pdf)
                 prova_id = supa.upsert("ingestao_provas", [{"concurso_ref": conc["id"], "cargo_cod": c["cod"], "cargo_nome": c["cargo"][:200], "tipo_prova": c["tipo"],
@@ -749,7 +750,9 @@ def processar_fgv(conc):
             except Exception as e:  # noqa: BLE001
                 log.append(f"{c['cargo'][:50]}: ERRO {e}" + (" (tenta de novo na próxima rodada)" if erro_passageiro(str(e)) else ""))
                 passageiro = passageiro or erro_passageiro(str(e))
-                if prova_id:
+                if prova_id and salvo and erro_passageiro(str(e)):  # conexão cortada, sobrecarga: volta para a fila
+                    guardar_para_ia(prova_id, salvo, f"erro passageiro, tenta de novo: {e}")
+                elif prova_id:
                     supa.update("ingestao_provas", {"id": f"eq.{prova_id}"}, {"status": "erro", "erro": str(e)[:500]})
         if adiado:
             log.append(f"continua na próxima execução (máx. {limite_cad} cadernos por vez)")
@@ -786,37 +789,79 @@ def _gabarito_fgv(gpdf, gpaginas, gabs, cargo, arquivo, tipo):
         return None, None, str(e)
 
 
+COBERTURA_MINIMA = 0.75  # fração das palavras do cargo numa linha do gabarito para dizer "este documento traz o cargo"
+
+
+def _gabarito_fgv_docs(urls, doc_de, cargo, arquivo, tipo):
+    """A FGV publica vários gabaritos definitivos (por cargo, dia de prova, nível, edital). Antes o robô lia só um, e 22
+    provas foram para 'erro' com "0 respostas lidas" (22/11/2026). Agora: o primeiro que casa pelo layout conhecido; senão o
+    que mais cita o cargo vai para a IA. -> (url, achado, respostas, motivo). Respostas {} = nenhum documento cita o cargo
+    (único caso de 'erro'); None = layout diferente ou IA sem ler (fica para a IA)."""
+    from urllib.parse import unquote
+    ordem = sorted(urls, key=lambda u: -fgv.cobertura([unquote(u.rsplit("/", 1)[-1]).replace("_", " ")], cargo, arquivo))
+    melhor, com_texto = (-1.0, None), False  # documento que mais cita o cargo
+    for u in ordem:
+        _, pags, gabs = doc_de(u)
+        par = fgv.achar_no_gabarito(gabs, cargo, arquivo, tipo)
+        if par:
+            return u, par[0], par[1], None
+        empate = fgv.empate_no_gabarito(gabs, cargo, arquivo, tipo)
+        if empate:  # não escolhe nem manda para a IA escolher: fica parado com o motivo
+            return u, None, None, empate
+        com_texto = com_texto or len("".join(pags).strip()) > 200
+        cob = fgv.cobertura(pags, cargo, arquivo)
+        if cob > melhor[0]:
+            melhor = (cob, u)
+        if cob >= 1.0:
+            break  # todas as palavras do cargo numa linha: é este
+    cob, u = melhor
+    if com_texto and cob < COBERTURA_MINIMA:
+        return u, None, {}, f"nenhum dos {len(urls)} gabaritos definitivos cita o cargo (melhor: {cob:.0%})"
+    achado, gab, motivo = _gabarito_fgv(*doc_de(u), cargo, arquivo, tipo)
+    if gab is not None and len(gab) < 10:  # o documento cita o cargo: falha de leitura, não documento errado
+        return u, None, None, f"IA leu {len(gab)} respostas num gabarito que cita o cargo; tenta de novo"
+    return u, achado, gab, motivo
+
+
 def ler_gabaritos_guardados(maximo=30):
     """Provas FGV guardadas sem gabarito ("layout diferente"): lê só o gabarito, com a lista LEVE (Flash Lite, 500/dia cada),
     antes e separado da transcrição (lista pesada, 20/dia). Antes a leitura vivia no laço do caderno, atrás da transcrição
     lenta, e 67 provas ficaram paradas desde outubro. Mais antigas primeiro. -> quantas leu."""
     if not ia.disponivel("gabarito"):
         return 0
-    provas = supa.select("ingestao_provas", {"select": "id,cargo_cod,cargo_nome,tipo_prova,origem", "status": "eq.aguardando_ia",
+    provas = supa.select("ingestao_provas", {"select": "id,concurso_ref,cargo_cod,cargo_nome,tipo_prova,origem", "status": "eq.aguardando_ia",
                                              "gabarito": "is.null", "concurso_ref": "like.fgv:*", "order": "criado_em.asc"})
-    s, docs, lidos, tentados = None, {}, 0, 0
+    s, docs, paginas, lidos, tentados = None, {}, {}, 0, 0
+
+    def doc_de(u):
+        if u not in docs:
+            docs[u] = _doc_gabarito_fgv(fgv.baixar(s, u))
+        return docs[u]
     for p in provas[:maximo]:
         if tempo_esgotado() or not ia.disponivel("gabarito"):
             break
-        gurl = (p.get("origem") or {}).get("gabarito_url")
-        if not gurl:
+        origem = p.get("origem") or {}
+        if not origem.get("gabarito_url"):
             continue
         tentados += 1
         try:
-            if gurl not in docs:
-                s = s or fgv.sessao()
-                docs[gurl] = _doc_gabarito_fgv(fgv.baixar(s, gurl))
-            achado, gab, motivo = _gabarito_fgv(*docs[gurl], p.get("cargo_nome") or "", p["cargo_cod"], p.get("tipo_prova") or "1")
+            s = s or fgv.sessao()
+            cid = (p.get("concurso_ref") or "").split(":", 1)[-1]
+            if cid not in paginas:  # todos os gabaritos definitivos da página, não só o que foi guardado
+                paginas[cid] = fgv.pagina(s, cid)[1]
+            urls = fgv.gabaritos_definitivos(paginas[cid], fgv.parte_do_caderno(paginas[cid], origem.get("url"))) or [origem["gabarito_url"]]
+            gurl, achado, gab, motivo = _gabarito_fgv_docs(urls, doc_de, p.get("cargo_nome") or "", p["cargo_cod"], p.get("tipo_prova") or "1")
         except Exception as e:  # noqa: BLE001  (site da banca fora do ar: tenta na próxima rodada)
             print(f"  gabarito {p['cargo_cod'][:40]}: ERRO {e}"); continue
         filtro = {"id": f"eq.{p['id']}"}
         if gab is None:  # motivo real e atual (cota, sobrecarga...) no lugar do texto antigo
             supa.update("ingestao_provas", filtro, {"erro": f"aguardando IA: gabarito em layout diferente ({motivo})"[:500]})
-        elif len(gab) < 10:  # o documento não traz o cargo (ex.: tcepa24, mprj2025): humano confere qual gabarito vale
-            supa.update("ingestao_provas", filtro, {"status": "erro", "erro": f"gabarito do cargo não encontrado no gabarito definitivo "
-                                                                         f"({len(gab)} respostas lidas): conferir se o documento é o certo"})
+        elif len(gab) < 10:  # nenhum gabarito definitivo da página cita o cargo: humano confere qual vale
+            supa.update("ingestao_provas", filtro, {"status": "erro", "erro": f"gabarito do cargo não encontrado: {motivo}; "
+                                                                         "conferir se o documento é o certo"[:500]})
         else:
             supa.update("ingestao_provas", filtro, {"gabarito": {str(k): v for k, v in gab.items()}, "n_questoes": len(gab),
+                                                    "origem": {**origem, "gabarito_url": gurl},
                                                     "erro": f"aguardando IA: gabarito lido ({str(achado)[:60]}); falta transcrever o caderno"[:500]})
             lidos += 1
     if provas:
@@ -837,8 +882,9 @@ def resumo_fila():
 
 
 def erro_passageiro(msg):
-    """Erro que some sozinho (API sobrecarregada, limite de taxa, timeout): vale tentar de novo amanhã."""
-    return bool(re.search(r"overloaded|\b529\b|\b429\b|rate.?limit|timed? ?out|timeout|\b50[234]\b|indispon|teto mensal", msg or "", re.I))
+    """Erro que some sozinho (API sobrecarregada, limite de taxa, timeout, conexão cortada): vale tentar de novo amanhã."""
+    return bool(re.search(r"overloaded|\b529\b|\b429\b|rate.?limit|timed? ?out|timeout|\b50[234]\b|indispon|teto mensal|"
+                          r"incompleteread|connection (broken|reset|aborted)", msg or "", re.I))
 
 
 def nome_orgao_cebraspe(nome):

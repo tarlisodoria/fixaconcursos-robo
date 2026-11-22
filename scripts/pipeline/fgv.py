@@ -151,9 +151,10 @@ def cadernos(partes):
     return list(achados.values())
 
 
-def gabarito_definitivo(partes, parte=None):
-    """URL do gabarito oficial definitivo da prova objetiva (o retificado, se houver). None se ainda não saiu.
-    parte: a subpágina do caderno (concursos com vários editais têm um gabarito por edital); sem gabarito lá, vale o da página principal."""
+def gabaritos_definitivos(partes, parte=None):
+    """URLs dos gabaritos oficiais definitivos da prova objetiva, do mais provável ao menos (retificado na frente).
+    A FGV publica vários por concurso (um por cargo, por dia de prova, por nível): quem escolhe o certo é o texto
+    (fgv.cobertura). parte: a subpágina do caderno (concursos com vários editais) vem primeiro; depois a página principal."""
     def cands_de(lista):
         cands = []
         for url_pag, h in lista:
@@ -163,14 +164,53 @@ def gabarito_definitivo(partes, parte=None):
                 alvo = f"{t} {unquote(u.rsplit('/', 1)[-1])}".lower()
                 if ".pdf" not in u.lower() or "gabarito" not in alvo or not re.search(r"defin", alvo):
                     continue
-                if re.search(r"discursiv|resultado|recurso", alvo):
+                if re.search(r"discursiv|resultado|recurso\b|comunicado", alvo):
                     continue
-                nota = (3 if "gabarito oficial definitivo" in t.lower() else 1) + (1 if "retific" in alvo or "atualizad" in alvo else 0) - (1 if "comunicado" in alvo else 0)
-                cands.append((nota, len(cands), u))
-        return cands
-    cands = cands_de([p for p in partes if p[0] == parte]) if parte else []
-    cands = cands or cands_de(partes[:1]) or cands_de(partes)
-    return max(cands)[2] if cands else None
+                nota = (3 if "gabarito oficial definitivo" in t.lower() else 1) + (1 if "retific" in alvo or "atualizad" in alvo else 0)
+                cands.append((-nota, len(cands), u))
+        return [u for *_, u in sorted(cands)]
+    out = []
+    for grupo in ([p for p in partes if p[0] == parte] if parte else [], partes[:1], partes):
+        out += [u for u in cands_de(grupo) if u not in out]
+    return out
+
+
+def gabarito_definitivo(partes, parte=None):
+    """O mais provável de gabaritos_definitivos (None se ainda não saiu)."""
+    lista = gabaritos_definitivos(partes, parte)
+    return lista[0] if lista else None
+
+
+def parte_do_caderno(partes, url_caderno):
+    """Subpágina onde está o link do caderno (para provas guardadas, que só têm a URL do caderno)."""
+    arq = (url_caderno or "").rsplit("/", 1)[-1]
+    return next((u for u, h in partes if arq and arq in h), None)
+
+
+VAZIAS = {"tipo", "de", "da", "do", "das", "dos", "e", "em", "a", "o", "area", "cargo", "prova", "objetiva", "nivel", "com",
+          "especialidade", "gabarito", "definitivo", "turno", "manha", "tarde"}
+SINONIMOS = {"ti": "tecnologia informacao"}
+RX_COD = re.compile(r"c?[dn][ms]\d+\w*$")  # código colado no fim do slug: "informaticacns103", "administracaonm201"
+
+
+def _palavras(t):
+    out = set()
+    for w in _norm(t).split():
+        w = SINONIMOS.get(w, RX_COD.sub("", w) if len(w) > 6 else w)
+        out |= {x for x in w.split() if x not in VAZIAS and not re.search(r"\d", x)}
+    return out
+
+
+def cobertura(texto_paginas, cargo, arquivo):
+    """0..1: fração das palavras do cargo na linha do gabarito que mais se parece com ele (cabeçalho do bloco do cargo).
+    Mede pelo nome e pelo arquivo do caderno e fica com o melhor (o nome às vezes vem com lixo da página)."""
+    linhas = [set(_norm(l).split()) for t in texto_paginas for l in (t or "").splitlines()]
+    melhor = 0.0
+    for fonte in (cargo, arquivo):
+        alvo = _palavras(fonte)
+        if alvo:
+            melhor = max([melhor] + [len(alvo & l) / len(alvo) for l in linhas])
+    return melhor
 
 
 def limpar_cargo(c):
@@ -212,10 +252,28 @@ def parse_gabarito(texto):
 def achar_no_gabarito(gabs, cargo, arquivo, tipo):
     """Cargo do caderno -> respostas do mesmo cargo e tipo no gabarito. Só aceita par seguro:
     nome quase igual (Jaccard >= 0.75) ou todas as palavras do cargo do gabarito presentes no nome do arquivo.
-    Empate entre dois cargos diferentes = None (melhor ficar sem do que pôr o gabarito errado)."""
+    Pelo arquivo, o cargo do gabarito também precisa cobrir 3/4 das palavras do caderno: "Auditor de Controle Externo -
+    Controle Externo" cabia inteiro no arquivo do auditor de TI (tcerr24, 22/11/2026).
+    Empate entre dois cargos diferentes = None (melhor ficar sem do que pôr o gabarito errado; motivo em empate_no_gabarito)."""
+    notas = _notas(gabs, cargo, arquivo, tipo)
+    if not notas or notas[0][0] < 0.75 or empate_no_gabarito(gabs, cargo, arquivo, tipo):
+        return None
+    return notas[0][2], notas[0][3]
+
+
+def empate_no_gabarito(gabs, cargo, arquivo, tipo):
+    """Motivo, quando dois cargos do gabarito casam com o caderno com a mesma nota; senão None."""
+    n = _notas(gabs, cargo, arquivo, tipo)
+    if len(n) > 1 and n[0][0] >= 0.75 and n[1][0] == n[0][0] and n[1][1] == n[0][1]:
+        return f"dois cargos parecidos no gabarito ({n[0][2][:60]} / {n[1][2][:60]}): não escolhe"
+    return None
+
+
+def _notas(gabs, cargo, arquivo, tipo):
     vazias = {"tipo", "de", "da", "do", "das", "dos", "e", "em", "a", "o", "area"}
     alvo = set(_norm(cargo).split()) - vazias
     arq = _norm(arquivo).replace(" ", "")
+    do_caderno = [a for a in (_palavras(cargo), _palavras(arquivo)) if a]
     notas = []
     for (nome, t), (orig, resp) in gabs.items():
         if t != str(tipo):
@@ -224,18 +282,28 @@ def achar_no_gabarito(gabs, cargo, arquivo, tipo):
         if not pal:
             continue
         j = len(pal & alvo) / len(pal | alvo) if alvo else 0.0
-        na = 0.9 if all(w in arq for w in pal) else 0.0
+        limpas = _palavras(orig)  # sem códigos (cns102, t02) e com "ti" = tecnologia informação
+        j = max([j] + [len(limpas & a) / len(limpas | a) for a in do_caderno if limpas])
+        cobre = max((len(pal & a) / len(a) for a in do_caderno), default=0.0)
+        na = 0.9 if all(w in arq for w in pal) and cobre >= 0.75 else 0.0
         notas.append((max(j, na), len(pal), orig, resp))
     notas.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    if not notas or notas[0][0] < 0.75:
-        return None
-    if len(notas) > 1 and notas[1][0] == notas[0][0] and notas[1][1] == notas[0][1]:
-        return None
-    return notas[0][2], notas[0][3]
+    return notas
+
+
+ESPERAS = (2, 5, 15)  # mesma política do supa.py
 
 
 def baixar(s, url):
-    r = _get(s, url)
+    """PDF da banca; conexão cortada no meio (IncompleteRead) ou timeout tenta de novo com espera crescente."""
+    for i, espera in enumerate(ESPERAS + (None,)):
+        try:
+            r = _get(s, url)
+            break
+        except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError):
+            if espera is None:
+                raise
+            time.sleep(espera)
     if not r.content.startswith(b"%PDF"):
         raise RuntimeError(f"não é PDF: {url}")
     return r.content

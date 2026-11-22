@@ -151,7 +151,7 @@ def _ler_transcricao(txt, parada, formato):
     m = re.search(r"\{.*\}", txt or "", re.S)
     if not m:
         raise RuntimeError(f"resposta sem JSON (stop={parada})")
-    dados = json.loads(m.group(0))
+    dados = json.loads(m.group(0), strict=False)  # IA às vezes manda quebra de linha crua dentro do texto
     textos = {t["id"]: t["texto"] for t in dados.get("textos") or []}
     out = []
     for q in dados.get("questoes") or []:
@@ -199,6 +199,6 @@ def gabarito_por_ia(pdf_bytes, texto, cargo_cod, cargo_nome, tipo):
         except RuntimeError as e:
             raise SemIA(_motivo_reserva(e)) from e
     m = re.search(r"\{.*\}", txt, re.S)
-    dados = json.loads(m.group(0)) if m else {}
+    dados = json.loads(m.group(0), strict=False) if m else {}
     resp = {int(k): (v.upper() if isinstance(v, str) and v.upper() in ("A", "B", "C", "D", "E") else None) for k, v in (dados.get("respostas") or {}).items()}
     return dados.get("cargo_encontrado"), resp

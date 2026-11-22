@@ -142,12 +142,13 @@ class TestGabaritoPelaListaLeve(Base):
     def test_le_so_os_gabaritos_mais_antigos_primeiro_e_grava_o_motivo_real(self):
         from ia_extrair import SemIA
         r = self.rodar
-        provas = [{"id": f"p{i}", "cargo_cod": f"cargo-{i}", "cargo_nome": f"Cargo {i}", "tipo_prova": "1",
+        provas = [{"id": f"p{i}", "concurso_ref": "fgv:x", "cargo_cod": f"cargo-{i}", "cargo_nome": f"Cargo {i}", "tipo_prova": "1",
                    "origem": {"url": "c.pdf", "gabarito_url": "https://conhecimento.fgv.br/g.pdf"}} for i in (1, 2, 3)]
         pedidos = []
         sup = Supa(lambda t, p: pedidos.append(p) or provas)
         ia_leve = mock.Mock(side_effect=[("Cargo 1", GAB80), ("?", {}), SemIA("Gemini sobrecarregado (503): tenta na próxima rodada")])
         with mock.patch.object(r, "supa", sup), mock.patch.object(r.fgv, "sessao"), mock.patch.object(r.fgv, "baixar", return_value=b"%PDF") as baixar, \
+             mock.patch.object(r.fgv, "pagina", return_value=("X", [("https://conhecimento.fgv.br/concursos/x", "")])) as pagina, \
              mock.patch.object(r, "_doc_gabarito_fgv", return_value=(b"%PDF", ["texto"], {})), \
              mock.patch.object(r, "tempo_esgotado", return_value=False), mock.patch.object(r.ia, "disponivel", return_value=True), \
              mock.patch("ia_extrair.gabarito_por_ia", ia_leve):
@@ -156,11 +157,14 @@ class TestGabaritoPelaListaLeve(Base):
         self.assertEqual(pedidos[0]["order"], "criado_em.asc")
         self.assertEqual(pedidos[0]["gabarito"], "is.null")
         baixar.assert_called_once()  # o mesmo gabarito definitivo serve aos três cargos
+        pagina.assert_called_once()  # a página do concurso também
         upd = {f["id"]: v for _, f, v in sup.updates}
         self.assertEqual(upd["eq.p1"]["n_questoes"], 80)
         self.assertEqual(upd["eq.p1"]["gabarito"]["1"], "B")
         self.assertIn("falta transcrever", upd["eq.p1"]["erro"])
-        self.assertEqual(upd["eq.p2"]["status"], "erro")  # o documento não traz o cargo: humano confere
+        # PDF sem texto e IA com 0 respostas: não prova que o cargo falta, fica na fila
+        self.assertNotIn("status", upd["eq.p2"])
+        self.assertIn("IA leu 0 respostas", upd["eq.p2"]["erro"])
         self.assertNotIn("status", upd["eq.p3"])
         self.assertIn("Gemini sobrecarregado (503)", upd["eq.p3"]["erro"])  # motivo atual no lugar do antigo
         self.assertIn("gabaritos: 1 lido(s) de 3", log)
@@ -180,7 +184,7 @@ class TestGabaritoPelaListaLeve(Base):
         sup = Supa()
         with mock.patch.object(r, "supa", sup), mock.patch.object(r.fgv, "sessao"), \
              mock.patch.object(r.fgv, "pagina", return_value=("Concurso X", [(cad["parte"], "")])), \
-             mock.patch.object(r.fgv, "cadernos", return_value=[cad]), mock.patch.object(r.fgv, "gabarito_definitivo", return_value="https://conhecimento.fgv.br/g.pdf"), \
+             mock.patch.object(r.fgv, "cadernos", return_value=[cad]), mock.patch.object(r.fgv, "gabaritos_definitivos", return_value=["https://conhecimento.fgv.br/g.pdf"]), \
              mock.patch.object(r.fgv, "baixar", side_effect=AssertionError("não devia baixar nada")), \
              mock.patch.object(r, "provas_do", return_value=[antiga]), mock.patch.object(r, "tempo_esgotado", return_value=False), \
              mock.patch.object(r, "rodada_cheia", return_value=False), mock.patch.object(r.ia, "disponivel", return_value=True), \
